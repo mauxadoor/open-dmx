@@ -37,6 +37,8 @@ pub struct DMXSerial {
     // Mode
     is_sync: ArcRwLock<bool>,
 
+    is_cyclic_reopen : ArcRwLock<bool>,
+
     min_time_break_to_break: ArcRwLock<time::Duration>,
 
 }
@@ -90,11 +92,14 @@ impl DMXSerial {
             channels: ArcRwLock::new([0; DMX_CHANNELS]),
             agent: AgentCommunication::new(agent_tx, agent_rx),
             is_sync: ArcRwLock::new(false),
+            is_cyclic_reopen : ArcRwLock::new(false),
             min_time_break_to_break: ArcRwLock::new(time::Duration::from_micros(22_700))};
 
         let mut agent = DMXSerialAgent::open(&port, dmx.min_time_break_to_break.read_only())?;
         let channel_view = dmx.channels.read_only();
         let is_sync_view = dmx.is_sync.read_only();
+        let is_cyclic_reopen_view = dmx.is_cyclic_reopen.read_only();
+        let portname = dmx.name.clone();
         let _ = thread::spawn(move || {
                 #[cfg(feature = "thread_priority")]
                 thread_priority::set_current_thread_priority(thread_priority::ThreadPriority::Max).unwrap_or_else(|e| {
@@ -110,9 +115,9 @@ impl DMXSerial {
                     }
 
                     let channels = channel_view.read().unwrap().clone();
-
+                    let is_cyclic_reopen = is_cyclic_reopen_view.read().unwrap().clone();
                     // If an error occurs, the thread will stop
-                    if let Err(_) = agent.send_dmx_packet(channels) {
+                    if let Err(_) = agent.send_dmx_packet(channels, &portname,is_cyclic_reopen) {
                         break;
                     }
 
@@ -163,6 +168,18 @@ impl DMXSerial {
         self.set_channels(channels);
         Ok(())
     }
+
+    
+    /// Reopens the com port after sending
+    /// 
+    /// Workaround for imx_uart; the break signal is only working the first time after opening the com port
+    ///
+    pub fn set_cyclic_reopen(&mut self) {
+        // RwLock can be unwrapped here
+        *self.is_cyclic_reopen.write().unwrap() = true;
+    }
+
+
     /// Gets the name of the Path on which the [DMXSerial] is opened.
     /// 
     ///  # Example
@@ -448,7 +465,7 @@ impl DMXSerialAgent {
         Ok(())
     }
     
-    pub fn send_dmx_packet(&mut self, channels: [u8; DMX_CHANNELS]) -> serialport::Result<()> {
+    pub fn send_dmx_packet(&mut self, channels: [u8; DMX_CHANNELS],portname : &str, is_cyclic_reopen : bool) -> serialport::Result<()> {
         let start = time::Instant::now();
         self.port.set_break()?;
         thread::sleep(TIME_BREAK_TO_DATA);
@@ -458,6 +475,20 @@ impl DMXSerialAgent {
         self.send_data(&prefixed_data)?;
 
         thread::sleep(self.min_b2b.read().unwrap().saturating_sub(start.elapsed()));
+
+        // reopen com port after every write
+        // this workaround is needed for imx_uarts as there the break signal is only working the first time after opening the port
+		if is_cyclic_reopen {
+			let _ = self.port.clear(serialport::ClearBuffer::Output);
+
+            self.port = serialport::new(portname, 250000)
+            .data_bits(serialport::DataBits::Eight)
+            .stop_bits(serialport::StopBits::Two)
+            .parity(serialport::Parity::None)
+            .flow_control(serialport::FlowControl::None)
+            .open()?;
+		}
+
 
         Ok(())
     }
